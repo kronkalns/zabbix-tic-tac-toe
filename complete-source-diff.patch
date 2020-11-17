@@ -1,0 +1,1377 @@
+diff --git a/ui/app/controllers/CControllerWidgetTicTacToe.php b/ui/app/controllers/CControllerWidgetTicTacToe.php
+new file mode 100644
+index 0000000000..61e447dde0
+--- /dev/null
++++ b/ui/app/controllers/CControllerWidgetTicTacToe.php
+@@ -0,0 +1,372 @@
++<?php
++
++/**
++ * Tic-tac-toe widget view controller.
++ *
++ * GAME STATES:
++ * -1 - no game;
++ *  0 - no opponent;
++ *  1 - player's turn;
++ *  2 - opponent's turn;
++ *  3 - game over.
++ *
++ * PLAYERS' ROLES:
++ * Player - 'X';
++ * Opponent - 'O'.
++ *
++ * Opponent has first move.
++ */
++class CControllerWidgetTicTacToe extends CControllerWidget {
++
++	protected $gameItemKey = 'tictactoe';
++	protected $player;
++	protected $game;
++	protected $host;
++	protected $state;
++
++	const ZBX_TIMEOUT = 3;
++
++	const STATE_NO_GAME = -1;
++	const STATE_NO_OPPONENT = 0;
++	const STATE_PLAYER_TURN = 1;
++	const STATE_OPPONENT_TURN = 2;
++	const STATE_GAME_OVER = 3;
++
++	const FIGURE_PLAYER = 'X';
++	const FIGURE_OPPONENT = 'O';
++	const FIGURE_EMPTY_SLOT = '.';
++
++	const BOARD_WIDTH_MIN = 100;
++	const BOARD_WIDTH_MAX = 1600;
++	const BOARD_HEIGHT_MIN = 100;
++	const BOARD_HEIGHT_MAX = 1600;
++
++	protected $zbx_server;
++	protected $zbx_port;
++
++	protected $player_figure;
++	protected $opponent_figure;
++	protected $game_figures;
++	protected $empty_board;
++
++	public function init() {
++		global $ZBX_SERVER, $ZBX_SERVER_PORT;
++
++		$this->zbx_server = $ZBX_SERVER;
++		$this->zbx_port = $ZBX_SERVER_PORT;
++
++		$this->state = self::STATE_NO_GAME;
++	}
++
++	public function __construct() {
++		parent::__construct();
++
++		$this->setType(WIDGET_TIC_TAC_TOE);
++		$this->empty_board = str_repeat(self::FIGURE_EMPTY_SLOT, 9);
++	}
++
++	protected function doAction() {
++		return;
++	}
++
++	/**
++	 * Join the selected game as second player.
++	 */
++	protected function joinTheGame(int $itemid, ?string &$error): bool {
++		$items = API::Item()->get([
++			'output' => ['itemid', 'key_', 'description'],
++			'hostids' => $this->host['hostid'],
++			'itemids' => $itemid,
++			'search' => ['key_' => $this->gameItemKey],
++			'monitored' => true
++		]);
++		$msg = '';
++
++		if (($item = reset($items)) !== false) {
++			$details = explode(',', substr($item['key_'], strlen($this->gameItemKey) + 1, -1));
++			if ($details[1] === '') {
++				$details[1] = $this->player['id'];
++			}
++			else {
++				$msg = 'Ouch! Someone else already picked this game.';
++			}
++
++			$description = json_decode($item['description'], true);
++			$oponents_nickname = ($description && array_key_exists($details[0], $description))
++				? $description[$details[0]]
++				: $details[0];
++
++			$result = API::Item()->update([
++				'key_' => $this->gameItemKey . '[' . implode(',', $details) . ']',
++				'description' => json_encode([
++					$details[0] => $oponents_nickname,
++					$this->player['id'] => $this->player['nickname']
++				]),
++				'itemid' => $itemid
++			]);
++
++			if (!$result) {
++				$msg = 'Unable to join the game.';
++			}
++		}
++		else {
++			$msg = 'Sorry, this game is not available anymore.';
++		}
++
++		if ($msg !== '') {
++			$error = $msg . ' Let\'s choose another game or start your own.';
++			return false;
++		}
++
++		return true;
++	}
++
++	/**
++	 * Function to find the host used for data exchange.
++	 */
++	protected function initStorageHost(array $fields, ?string &$error): bool {
++		$hosts = array_key_exists('hostid', $fields)
++			? API::Host()->get([
++				'output' => ['hostid', 'host'],
++				'hostids' => $fields['hostid'],
++				'editable' => true
++			])
++			: [];
++
++		if (($host = reset($hosts)) !== false) {
++			$this->host = $host;
++			return true;
++		}
++		else {
++			$error = _('No permissions to referred object or it does not exist!');
++			return false;
++		}
++	}
++
++	/**
++	 * Set player details.
++	 */
++	protected function initPlayer(array $fields, ?string &$error): bool {
++		if (array_key_exists('reference', $fields) && $fields['reference'] === '') {
++			$error = 'Widget reference missing.';
++			return false;
++		}
++
++		$playerid = $fields['reference'].'_'.CWebUser::$data['userid'];
++		$this->player = [
++			'id' => $playerid,
++			'nickname' => (array_key_exists('nickname', $fields) && $fields['nickname'] !== '')
++				? $fields['nickname']
++				: $playerid
++		];
++
++		return true;
++	}
++
++	protected function loadActiveGames(): array {
++		$items = API::Item()->get([
++			'output' => ['itemid', 'key_', 'value_type', 'description'],
++			'hostids' => $this->host['hostid'],
++			'search' => ['key_' => $this->gameItemKey],
++			'monitored' => true
++		]);
++
++		// Extract details.
++		foreach ($items as $i => &$item) {
++			$details = explode(',', substr($item['key_'], strlen($this->gameItemKey) + 1, -1));
++			$nicknames = json_decode($item['description'], true) ? : [];
++
++			if (count($details) == 2) {
++				unset($item['description']);
++
++				if ($this->player['id'] === $details[0]) {
++					$item += [
++						'player' => $this->player['nickname'],
++						'opponent' => array_key_exists($details[1], $nicknames)
++							? $nicknames[$details[1]]
++							: $details[1],
++						'author' => true
++					];
++					if (!$this->game) {
++						$this->game = $item;
++					}
++					$this->player_figure = self::FIGURE_PLAYER;
++					$this->opponent_figure = self::FIGURE_OPPONENT;
++				}
++				elseif ($this->player['id'] === $details[1]) {
++					$item += [
++						'player' => $this->player['nickname'],
++						'opponent' => array_key_exists($details[0], $nicknames)
++							? $nicknames[$details[0]]
++							: $details[0],
++						'author' => false
++					];
++					if (!$this->game) {
++						$this->game = $item;
++					}
++					$this->player_figure = self::FIGURE_OPPONENT;
++					$this->opponent_figure = self::FIGURE_PLAYER;
++				}
++				elseif ($details[1] === '') {
++					$item += [
++						'player' => '',
++						'opponent' => array_key_exists($details[0], $nicknames)
++							? $nicknames[$details[0]]
++							: $details[0],
++						'author' => false
++					];
++				}
++				else {
++					unset($items[$i]);
++					continue;
++				}
++			}
++			else {
++				unset($items[$i]);
++			}
++		}
++		unset($item);
++
++		return $items;
++	}
++
++	/**
++	 * Function to check current game validity and return current game result.
++	 */
++	protected function loadGameFigures(?string &$error): string {
++		$figures = Manager::History()->getLastValues([$this->game], 10);
++		if (!$figures) {
++			return $this->empty_board;
++		}
++
++		$figures = reset($figures);
++		$figures = array_slice($figures, 0, (array_search($this->empty_board, array_column($figures, 'value'))));
++
++		if (!$this->checkIntegrity($figures)) {
++			$error = 'Results are corrupted.';
++			$this->state = self::STATE_GAME_OVER;
++		}
++
++		return $figures ? reset($figures)['value'] : $this->empty_board;
++	}
++
++	/**
++	 * Check integrity of all previous moves of the game.
++	 */
++	protected function checkIntegrity(array $figures): bool {
++		$moves = array_fill_keys(range(0, 8), self::FIGURE_EMPTY_SLOT);
++		foreach (array_reverse($figures) as $index => $figure) {
++			$expected_move = ($index % 2 == 0) ? self::FIGURE_OPPONENT : self::FIGURE_PLAYER;
++			$diff = array_diff_assoc(str_split($figure['value']), $moves);
++			if (count($diff) != 1 || reset($diff) !== $expected_move) {
++				return false;
++			}
++			$moves[array_keys($diff)[0]] = $expected_move;
++		}
++
++		return true;
++	}
++
++	/**
++	 * Get the current state of the figures and who's turn it is.
++	 */
++	protected function loadMatchResult(&$error) {
++		$this->game_figures = $this->loadGameFigures($error);
++		$empty_slots = substr_count($this->game_figures, self::FIGURE_EMPTY_SLOT);
++
++		// Get current state.
++		if ($empty_slots == 0) {
++			$this->state = self::STATE_GAME_OVER;;
++		}
++		elseif ($empty_slots == 9) {
++			$this->state = $this->game['author'] ? self::STATE_OPPONENT_TURN : self::STATE_PLAYER_TURN;
++		}
++		elseif (((9 - $empty_slots) % 2) == 0) {
++			// Same number of moves.
++			$this->state = $this->game['author'] ? self::STATE_OPPONENT_TURN : self::STATE_PLAYER_TURN;
++		}
++		else {
++			// Opponent has done one move more.
++			$this->state = $this->game['author'] ? self::STATE_PLAYER_TURN : self::STATE_OPPONENT_TURN;
++		}
++	}
++
++	/**
++	 * Send new game state using Zabbix sender protocol.
++	 *
++	 * @param string           $value
++	 * @param string|nullable  $error
++	 *
++	 * @return boolean
++	 */
++	protected function sendTrapperValue(string $value, &$error): bool {
++        $settings = [
++			'usec' => (self::ZBX_TIMEOUT - floor(self::ZBX_TIMEOUT)) * 1e6,
++			'sec' => floor(self::ZBX_TIMEOUT)
++		];
++
++		$data = json_encode([
++            'request' => 'sender data',
++            'data' => [[
++				'host' => $this->host['host'],
++				'key' => $this->game['key_'],
++				'value' => $value,
++				'clock' => time()
++			]]
++        ]);
++
++		$msg = "ZBXD\1" . pack('V', strlen($data)) . "\0\0\0\0" . $data;
++
++		$socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
++        if (!$socket) {
++			$error = socket_strerror(socket_last_error());
++			return false;
++        }
++
++		socket_set_option($socket, SOL_SOCKET, SO_SNDTIMEO, $settings);
++        socket_set_option($socket, SOL_SOCKET, SO_RCVTIMEO, $settings);
++
++		$result = socket_connect($socket, $this->zbx_server, $this->zbx_port);
++
++        if (($result = socket_send($socket, $msg, strlen($msg), 0)) === false) {
++			//$error = error(socket_strerror(socket_last_error($socket)));
++			$error = 'Server is not reachable.';
++			return false;
++        }
++        socket_recv($socket, $resp, 1024, 0);
++
++        if ($resp) {
++            $ret = json_decode(mb_substr($resp, 13), true);
++			if ($ret['response'] === 'success') {
++				$ret = !(strstr($ret['info'], 'failed: 1;'));
++				if (!$ret) {
++					$error = 'This can happen if Zabbix configuration cache is not reloaded.';
++				}
++			}
++        }
++		else {
++			$error = 'Server is not reachable.';
++			$ret = false;
++		}
++
++        socket_close($socket);
++
++		return $ret;
++	}
++
++	/**
++	 * Start a new game (create an item to store player moves and other game details).
++	 */
++	protected function createNewGame(): void {
++		API::Item()->create([
++			'name' => 'Tic-tac-toe match',
++			'key_' => $this->gameItemKey . '[' . $this->player['id'] . ',]',
++			'hostid' => $this->host['hostid'],
++			'type' => ITEM_TYPE_TRAPPER,
++			'value_type' => ITEM_VALUE_TYPE_STR,
++			'description' => json_encode([
++				$this->player['id'] => $this->player['nickname']
++			])
++		]);
++	}
++}
+diff --git a/ui/app/controllers/CControllerWidgetTicTacToeUpdate.php b/ui/app/controllers/CControllerWidgetTicTacToeUpdate.php
+new file mode 100644
+index 0000000000..21e7a7fbef
+--- /dev/null
++++ b/ui/app/controllers/CControllerWidgetTicTacToeUpdate.php
+@@ -0,0 +1,69 @@
++<?php
++
++class CControllerWidgetTicTacToeUpdate extends CControllerWidgetTicTacToe {
++	public function __construct() {
++		parent::__construct();
++
++		$this->setValidationRules([
++			'do' => 'required|in startNewGame,startNewMatch,makeTheMove,joinTheGame',
++			'uniqueid' => 'required|string',
++			'move' => 'in 1,2,3,4,5,6,7,8,9',
++			'itemid' => 'db items.itemid',
++			'fields' => 'json'
++		]);
++	}
++
++	protected function doAction() {
++		$fields = $this->getForm()->getFieldsData();
++		$error = null;
++
++		if ($this->initPlayer($fields, $error) && $this->initStorageHost($fields, $error)) {
++			switch ($this->getInput('do')) {
++				case 'joinTheGame':
++					$itemid = $this->getInput('itemid', 0);
++					if ($itemid != 0) {
++						$this->joinTheGame($itemid, $error);
++						$this->sendTrapperValue($this->empty_board, $error);
++					}
++					break;
++
++				case 'startNewMatch':
++					$this->loadActiveGames();
++					$this->loadMatchResult($error);
++					$this->sendTrapperValue($this->empty_board, $error);
++					break;
++
++				case 'startNewGame':
++					$this->loadActiveGames();
++					if ($this->game) {
++						API::Item()->delete([$this->game['itemid']]);
++					}
++					$this->createNewGame();
++					break;
++
++				case 'makeTheMove':
++					$move = $this->getInput('move', 0);
++					if ($move != 0) {
++						$this->loadActiveGames();
++						$this->loadMatchResult($error);
++
++						$str_before = substr($this->game_figures, 0, $move - 1);
++						$str_after = substr($this->game_figures, $move, 9);
++						$result = $str_before . $this->player_figure . $str_after;
++
++						$this->sendTrapperValue($result, $error);
++					}
++					break;
++			}
++		}
++
++		$this->setResponse(new CControllerResponseData([
++			'game' => [
++				'error' => $error
++			],
++			'user' => [
++				'debug_mode' => $this->getDebugMode()
++			]
++		]));
++	}
++}
+diff --git a/ui/app/controllers/CControllerWidgetTicTacToeView.php b/ui/app/controllers/CControllerWidgetTicTacToeView.php
+new file mode 100644
+index 0000000000..f88e1f9865
+--- /dev/null
++++ b/ui/app/controllers/CControllerWidgetTicTacToeView.php
+@@ -0,0 +1,97 @@
++<?php
++
++class CControllerWidgetTicTacToeView extends CControllerWidgetTicTacToe {
++
++	public function __construct() {
++		parent::__construct();
++
++		$this->setValidationRules([
++			'name' => 'string',
++			'uniqueid' => 'required|string',
++			'initial_load' => 'in 0,1',
++			'content_width' => 'int32|ge '.self::BOARD_WIDTH_MIN.'|le '.self::BOARD_WIDTH_MAX,
++			'content_height' => 'int32|ge '.self::BOARD_HEIGHT_MIN.'|le '.self::BOARD_HEIGHT_MAX,
++			'fields' => 'json'
++		]);
++	}
++
++	protected function doAction() {
++		$fields = $this->getForm()->getFieldsData();
++		$error = null;
++		$items = [];
++
++		if ($this->initPlayer($fields, $error) && $this->initStorageHost($fields, $error)) {
++			$items = $this->loadActiveGames();
++
++			if (!$this->game) {
++				CArrayHelper::sort($items, ['clock' => ZBX_SORT_DOWN]);
++			}
++			else {
++				if ($this->game['opponent'] === '') {
++					$this->state = self::STATE_NO_OPPONENT;
++				}
++				else {
++					$this->loadMatchResult($error);
++
++					// Check if server is ready.
++					if ($this->game_figures === $this->empty_board) {
++						$this->sendTrapperValue($this->empty_board, $error);
++					}
++				}
++			}
++		}
++
++		$this->setResponse(new CControllerResponseData([
++			'name' => $this->getInput('name', $this->getDefaultHeader()),
++			'script_inline' => $this->getScript(),
++			'error' => $error,
++			'game_state' => $this->state,
++			'game' => $this->game,
++			'games' => $items,
++			'canvas' => [
++				'size' => min($this->getInput('content_width'), $this->getInput('content_height')) - 4,
++				'top' => ($this->getInput('content_height') > $this->getInput('content_width'))
++					? ((int) $this->getInput('content_height') - (int) $this->getInput('content_width')) / 2
++					: 0
++			],
++			'user' => [
++				'debug_mode' => $this->getDebugMode()
++			]
++		]));
++	}
++
++	protected function getScript(): string {
++		$uniqueid = $this->getInput('uniqueid');
++		$game_options = [
++			'state' => $this->state,
++			'figures' => $this->game_figures,
++			'figure' => $this->player_figure,
++			'opponent' => $this->game['opponent']
++		];
++
++		$script_inline =
++			'var widget = jQuery(".dashbrd-grid-container").dashboardGrid(\'getWidgetsBy\', \'uniqueid\', "'.$uniqueid.'");'.
++			'jQuery(widget[0]["content_body"]).tictactoe('. json_encode($game_options).', widget[0]);';
++
++		if ($this->getInput('initial_load', 1)) {
++			$script_inline .=
++				'jQuery(".dashbrd-grid-container").dashboardGrid("addAction", "onResizeEnd",'.
++					'"zbx_tictactoe_widget_trigger", "'.$uniqueid.'", {'.
++						'parameters: ["onResizeEnd"],'.
++						'grid: {widget: 1},'.
++						'trigger_name: "tictactoe_widget_resize_end_'.$uniqueid.'"'.
++			'});';
++
++//			$script_inline .=
++//				'jQuery(".dashbrd-grid-container").dashboardGrid("addAction", "timer_refresh",'.
++//					'"zbx_tictactoe_widget_trigger", "'.$uniqueid.'", {'.
++//						'parameters: ["onWidgetRefresh"],'.
++//						'grid: {widget: 1},'.
++//						'trigger_name: "tictactoe_widget_refresh_'.$uniqueid.'"'.
++//					'}'.
++//				');';
++		}
++
++		return $script_inline;
++	}
++}
+diff --git a/ui/app/views/monitoring.dashboard.view.php b/ui/app/views/monitoring.dashboard.view.php
+index 007e267dbc..d099b88c37 100644
+--- a/ui/app/views/monitoring.dashboard.view.php
++++ b/ui/app/views/monitoring.dashboard.view.php
+@@ -47,6 +47,7 @@ $this->addJsFile('class.mapWidget.js');
+ $this->addJsFile('class.svg.canvas.js');
+ $this->addJsFile('class.svg.map.js');
+ $this->addJsFile('class.tab-indicators.js');
++$this->addJsFile('class.tictactoe.js');
+ 
+ $this->includeJsFile('dashboard/class.dashboard.js.php');
+ $this->includeJsFile('dashboard/class.dashboard-share.js.php');
+diff --git a/ui/app/views/monitoring.widget.tictactoe.view.php b/ui/app/views/monitoring.widget.tictactoe.view.php
+new file mode 100644
+index 0000000000..310ce8a1bb
+--- /dev/null
++++ b/ui/app/views/monitoring.widget.tictactoe.view.php
+@@ -0,0 +1,112 @@
++<?php
++if ($data['error'] !== null) {
++	$output = [
++		'header' => $data['name'],
++		'body' => (new CTableInfo())
++			->setNoDataMessage($data['error'])
++			->toString()
++	];
++}
++else {
++	$style = $data['canvas']['top']
++		? 'text-align: center; margin-top:'.$data['canvas']['top'].'px;'
++		: 'text-align: center;';
++	$item = (new CDiv())->addStyle($style);
++
++	switch ($data['game_state']) {
++		case CControllerWidgetTicTacToe::STATE_NO_GAME:
++			$games_list = new CList();
++
++			if ($data['games']) {
++				$games_list->addItem([
++					(new CSpan('Choose the opponent to play with or start a new game and ask others to join you.'))
++						->addStyle('display:block; padding:0 15%;'),
++					new CTag('br')
++				]);
++				foreach ($data['games'] as $game) {
++					$games_list->addItem(
++						(new CLink('Play with '.$game['opponent']))
++							->setAttribute('data-itemid', $game['itemid'])
++							->addClass('match-to-join')
++					);
++				}
++			}
++			else {
++				$games_list->addItem([
++					'There are no game matches to join.',
++					new CTag('br'),
++					new CTag('br'),
++					'You can either to wait while someone appears or start a new game and ask others to join you.',
++					new CTag('br')
++				]);
++			}
++
++			$item->addItem(
++					(new CDiv([
++						$games_list,
++						new CTag('br'),
++						(new CButton('button', 'Start a new game'))->addClass('start-new-game-btn')
++					]))->addStyle('display:table-cell; vertical-align:middle; max-width:70%;')
++				)
++				->addStyle('display:table; height:100%; width:100%; padding-bottom:33px;');
++			break;
++
++		case CControllerWidgetTicTacToe::STATE_NO_OPPONENT:
++			$status_msg = 'Waiting for oponent.';
++
++			if (count($data['games']) > 1) {
++				$games_list = new CList();
++
++				$games_list->addItem('There are other games as well...');
++				foreach ($data['games'] as $game) {
++					if (!$game['author']) {
++						$games_list->addItem(
++							(new CLink('Play with '.$game['opponent']))
++								->setAttribute('data-itemid', $game['itemid'])
++								->addClass('match-to-join')
++						);
++					}
++				}
++			}
++			else {
++				$games_list = null;
++			}
++
++			$item->addItem(
++					(new CDiv([
++						$status_msg,
++						$games_list ? [new CTag('br'), new CTag('br'), $games_list] : null
++					]))->addStyle('display:table-cell; vertical-align:middle;')
++				)
++				->addStyle('display:table; height:100%; width:100%; padding-bottom:33px;');
++			break;
++
++		case CControllerWidgetTicTacToe::STATE_PLAYER_TURN:
++		case CControllerWidgetTicTacToe::STATE_OPPONENT_TURN:
++		case CControllerWidgetTicTacToe::STATE_GAME_OVER:
++			$item->addItem(
++				(new CTag('canvas'))
++					->setAttribute('width', $data['canvas']['size'])
++					->setAttribute('height', $data['canvas']['size'])
++					->addClass('game-board')
++			);
++			break;
++	}
++
++	$output = [
++		'header' => $data['name'],
++		'body' => $item->toString(),
++		'script_inline' => $data['script_inline']
++	];
++}
++
++if (($messages = getMessages()) !== null) {
++	$output['messages'] = $messages->toString();
++}
++
++if ($data['user']['debug_mode'] == GROUP_DEBUG_MODE_ENABLED) {
++	CProfiler::getInstance()->stop();
++	$output['debug'] = CProfiler::getInstance()->make()->toString();
++}
++
++echo json_encode($output);
+diff --git a/ui/include/classes/mvc/CRouter.php b/ui/include/classes/mvc/CRouter.php
+index 06b80e718c..882f351a1c 100644
+--- a/ui/include/classes/mvc/CRouter.php
++++ b/ui/include/classes/mvc/CRouter.php
+@@ -246,6 +246,8 @@ class CRouter {
+ 		'widget.trigover.view'			=> ['CControllerWidgetTrigOverView',				'layout.widget',		'monitoring.widget.trigover.view'],
+ 		'widget.url.view'				=> ['CControllerWidgetUrlView',						'layout.widget',		'monitoring.widget.url.view'],
+ 		'widget.web.view'				=> ['CControllerWidgetWebView',						'layout.widget',		'monitoring.widget.web.view'],
++		'widget.tictactoe.view'			=> ['CControllerWidgetTicTacToeView',				'layout.widget',		'monitoring.widget.tictactoe.view'],
++		'widget.tictactoe.update'		=> ['CControllerWidgetTicTacToeUpdate',				'layout.javascript',	null],
+ 
+ 		// legacy actions
+ 		'actionconf.php'				=> ['CLegacyAction', null, null],
+diff --git a/ui/include/classes/widgets/CWidgetConfig.php b/ui/include/classes/widgets/CWidgetConfig.php
+index a08e79b5cc..05bc9b42e4 100644
+--- a/ui/include/classes/widgets/CWidgetConfig.php
++++ b/ui/include/classes/widgets/CWidgetConfig.php
+@@ -60,6 +60,7 @@ class CWidgetConfig {
+ 			WIDGET_PROBLEMS_BY_SV		=> _('Problems by severity'),
+ 			WIDGET_SVG_GRAPH			=> _('Graph'),
+ 			WIDGET_SYSTEM_INFO			=> _('System information'),
++			WIDGET_TIC_TAC_TOE			=> _('Tic-Tac-Toe'),
+ 			WIDGET_TRIG_OVER			=> _('Trigger overview'),
+ 			WIDGET_URL					=> _('URL'),
+ 			WIDGET_WEB					=> _('Web monitoring')
+@@ -102,6 +103,7 @@ class CWidgetConfig {
+ 			WIDGET_PROBLEMS_BY_SV		=> ['width' => 12,	'height' => 5],
+ 			WIDGET_SVG_GRAPH			=> ['width' => 12,	'height' => 5],
+ 			WIDGET_SYSTEM_INFO			=> ['width' => 12,	'height' => 5],
++			WIDGET_TIC_TAC_TOE			=> ['width' => 6,	'height' => 6],
+ 			WIDGET_TRIG_OVER			=> ['width' => 12,	'height' => 5],
+ 			WIDGET_URL					=> ['width' => 12,	'height' => 5],
+ 			WIDGET_WEB					=> ['width' => 6,	'height' => 3]
+@@ -183,6 +185,7 @@ class CWidgetConfig {
+ 			case WIDGET_PROBLEMS:
+ 			case WIDGET_PROBLEMS_BY_SV:
+ 			case WIDGET_SVG_GRAPH:
++			case WIDGET_TIC_TAC_TOE:
+ 			case WIDGET_TRIG_OVER:
+ 			case WIDGET_WEB:
+ 				return SEC_PER_MIN;
+@@ -389,6 +392,9 @@ class CWidgetConfig {
+ 			case WIDGET_SVG_GRAPH:
+ 				return new CWidgetFormSvgGraph($data, $templateid);
+ 
++			case WIDGET_TIC_TAC_TOE:
++				return new CWidgetFormTicTacToe($data, $templateid);
++
+ 			case WIDGET_TRIG_OVER:
+ 				return new CWidgetFormTrigOver($data, $templateid);
+ 
+diff --git a/ui/include/classes/widgets/forms/CWidgetFormTicTacToe.php b/ui/include/classes/widgets/forms/CWidgetFormTicTacToe.php
+new file mode 100644
+index 0000000000..1320739222
+--- /dev/null
++++ b/ui/include/classes/widgets/forms/CWidgetFormTicTacToe.php
+@@ -0,0 +1,38 @@
++<?php
++
++class CWidgetFormTicTacToe extends CWidgetForm {
++
++	public function __construct($data, $templateid) {
++		parent::__construct($data, $templateid, WIDGET_TIC_TAC_TOE);
++
++		// Nickname field.
++		$field_nickname = (new CWidgetFieldTextBox('nickname', _('Nickname')))
++			->setFlags(CWidgetField::FLAG_NOT_EMPTY | CWidgetField::FLAG_LABEL_ASTERISK);
++
++		if (array_key_exists('nickname', $this->data)) {
++			$field_nickname->setValue($this->data['nickname']);
++		}
++
++		$this->fields[$field_nickname->getName()] = $field_nickname;
++
++		// Host field.
++		$field_host = (new CWidgetFieldMsHost('hostid', _('Editable host')))
++			->setFlags(CWidgetField::FLAG_NOT_EMPTY | CWidgetField::FLAG_LABEL_ASTERISK)
++			->setMultiple(false);
++
++		if (array_key_exists('hostid', $this->data)) {
++			$field_host->setValue($this->data['hostid']);
++		}
++
++		$this->fields[$field_host->getName()] = $field_host;
++
++		// Widget reference field.
++		$field_reference = (new CWidgetFieldReference())->setDefault('');
++
++		if (array_key_exists($field_reference->getName(), $this->data)) {
++			$field_reference->setValue($this->data[$field_reference->getName()]);
++		}
++
++		$this->fields[$field_reference->getName()] = $field_reference;
++	}
++}
+diff --git a/ui/include/classes/widgets/views/widget.tictactoe.form.view.php b/ui/include/classes/widgets/views/widget.tictactoe.form.view.php
+new file mode 100644
+index 0000000000..5c4d1705a8
+--- /dev/null
++++ b/ui/include/classes/widgets/views/widget.tictactoe.form.view.php
+@@ -0,0 +1,30 @@
++<?php
++$fields = $data['dialogue']['fields'];
++$form = CWidgetHelper::createForm();
++$rf_rate_field = ($data['templateid'] === null) ? $fields['rf_rate'] : null;
++
++$form_list = CWidgetHelper::createFormList($data['dialogue']['name'], $data['dialogue']['type'],
++	$data['dialogue']['view_mode'], $data['known_widget_types'], $rf_rate_field
++);
++
++// Nickname.
++$form_list->addRow(CWidgetHelper::getLabel($fields['nickname']), CWidgetHelper::getTextBox($fields['nickname']));
++
++// Host.
++$field_hostid = CWidgetHelper::getHost($fields['hostid'], $data['captions']['ms']['hosts']['hostid'], $form->getName());
++$form_list->addRow(CWidgetHelper::getMultiselectLabel($fields['hostid']), $field_hostid);
++$form->addItem($form_list);
++$scripts[] = $field_hostid->getPostJS();
++
++// Reference field.
++$field_reference = $fields[CWidgetFieldReference::FIELD_NAME];
++$form->addItem((new CVar($field_reference->getName(), $field_reference->getValue()))->removeId());
++
++if ($field_reference->getValue() === '') {
++	$scripts[] = $field_reference->getJavascript('#'.$form->getAttribute('id'));
++}
++
++return [
++	'form' => $form,
++	'scripts' => $scripts
++];
+diff --git a/ui/include/defines.inc.php b/ui/include/defines.inc.php
+index 39238a5f00..05e0fcacde 100644
+--- a/ui/include/defines.inc.php
++++ b/ui/include/defines.inc.php
+@@ -1447,6 +1447,7 @@ define('WIDGET_SYSTEM_INFO',		'systeminfo');
+ define('WIDGET_TRIG_OVER',			'trigover');
+ define('WIDGET_URL',				'url');
+ define('WIDGET_WEB',				'web');
++define('WIDGET_TIC_TAC_TOE',		'tictactoe');
+ 
+ // sysmap widget source types
+ define('WIDGET_SYSMAP_SOURCETYPE_MAP',	1);
+diff --git a/ui/js/class.tictactoe.js b/ui/js/class.tictactoe.js
+new file mode 100644
+index 0000000000..045515323e
+--- /dev/null
++++ b/ui/js/class.tictactoe.js
+@@ -0,0 +1,527 @@
++/**
++ * Widget hooks.
++ */
++function zbx_tictactoe_widget_trigger(hook_name) {
++	var grid = Array.prototype.slice.call(arguments, -1),
++		grid = grid.length ? grid[0] : null;
++
++	if (grid) {
++		if (hook_name === 'onResizeEnd') {
++			jQuery('.dashbrd-grid-container').dashboardGrid('refreshWidget', grid.widget['uniqueid']);
++//		} else if (hook_name === 'onWidgetRefresh') {
++//			console.log(grid.widget);
++//			return false;
++		}
++	}
++}
++
++/**
++ * Main widget class.
++ */
++jQuery(function($) {
++	"use strict";
++
++	const YOU_WON = 1;
++	const OPPONENT_WON = 2;
++	const DRAWN = 3;
++
++	const STATE_PLAYER_TURN = 1;
++	const STATE_OPPONENT_TURN = 2;
++
++	var ticTacToe = function() {
++		this.canvasSize = 300;
++		this.padding = 5;
++		this.gridCellSize = (this.canvasSize - this.padding * 2) / 3;
++		this.lineWidth = 6;
++		this.figureLineWidth = 10;
++		this.gridColor = '#d0cece';
++		this.ghostColor = '#d5e9ee';
++		this.crossLineColor = '#ff9800';
++		this.figOColor = '#87cfc9';
++		this.figXColor = '#94a261';
++		this.frozen = true;
++	};
++
++	ticTacToe.prototype = {
++		initGame: function(data) {
++			this.widget = data.widget;
++			this.canvas = data.widget['content_body'][0].getElementsByClassName('game-board')[0];
++			this.context = this.canvas.getContext('2d');
++			this.canvasSize = this.canvas.offsetWidth;
++
++			this.drawGrid();
++			this.game = data.figures || '.........';
++			this.figure = data.figure;
++			this.opponent = data.opponent;
++			this.state = data.state;
++			this.drawGameFigures();
++
++			if (!this.showResult()) {
++				if (data.state == 2) {
++					this.showMessage('It\'s '+encode(this.opponent)+'\'s move.');
++				} else {
++					this.canvas.addEventListener('mouseup', this.onClickHandler.bind(this));
++					this.canvas.addEventListener('mousemove', this.onMouseMoveHandler.bind(this));
++					this.frozen = false;
++				}
++			}
++		},
++		showMessage: function() {
++			let overlay = document.createElement('div');
++			this.widget.content_body[0].appendChild(overlay);
++
++			let mt = parseFloat(this.canvas.parentNode.offsetTop) + this.canvasSize / 2,
++				style = 'margin:0px auto; text-align:center; font-size:1.2rem; line-height:1.8rem; margin-top:calc(' + mt + 'px - 20px);';
++
++			overlay.style.position = 'absolute';
++			overlay.style.height = 'calc(100% - 10px)';
++			overlay.style.width = 'calc(100% - 10px)';
++			overlay.style.backgroundColor = '#00000036';
++			overlay.style.left = '5px';
++			overlay.style.top = '5px';
++			overlay.style.right = '5px';
++			overlay.style.textAlign = 'center';
++			overlay.innerHTML = '<div style="' + style + '">' + arguments[0] + '</div>';
++
++			if (arguments.length > 1) {
++				let x = 0;
++				while (arguments[++x] != undefined) {
++					var div = document.createElement('div');
++					div.appendChild(arguments[x]);
++					div.style.margin = '10px 0';
++					overlay.appendChild(div);
++				}
++			}
++		},
++		getPoint: function(i) {
++			if (i == 0) {
++				return this.padding;
++			} else if (i == 3) {
++				return this.canvasSize - this.padding;
++			} else {
++				return (this.gridCellSize * i) + this.padding;
++			}
++		},
++		drawGrid: function() {
++			this.gridCellSize = (this.canvasSize - this.padding * 2) / 3;
++			this.context.lineWidth = this.lineWidth;
++			this.context.strokeStyle = this.gridColor;
++			this.context.lineCap = 'round';
++			this.context.beginPath();
++			for (let i = 1; 3 > i; i++) {
++				this.context.moveTo(this.getPoint(0), this.getPoint(i));
++				this.context.lineTo(this.getPoint(3), this.getPoint(i));
++			}
++			for (let i = 1; 3 > i; i++) {
++				this.context.moveTo(this.getPoint(i), this.getPoint(0));
++				this.context.lineTo(this.getPoint(i), this.getPoint(3));
++			}
++			this.context.stroke();
++		},
++		drawO: function(pos, color) {
++			let diameter = this.gridCellSize * 0.7;
++			let centerX = this.gridCellSize / 2 + pos.x;
++			let centerY = this.gridCellSize / 2 + pos.y;
++
++			this.context.lineWidth = this.figureLineWidth;
++			this.context.strokeStyle = color || this.figOColor;
++			this.context.beginPath();
++			this.context.arc(centerX, centerY, diameter / 2, 0 * Math.PI, 2 * Math.PI);
++			this.context.stroke();
++		},
++		drawX: function(pos, color) {
++			let a = this.gridCellSize * 0.6,
++				p = (this.gridCellSize - a) / 2;
++
++			this.context.lineWidth = this.figureLineWidth;
++			this.context.strokeStyle = color || this.figXColor;
++			this.context.beginPath();
++			this.context.moveTo(pos.x + p, pos.y + p);
++			this.context.lineTo(pos.x + p + a, pos.y + p + a);
++			this.context.moveTo(pos.x + p + a, pos.y + p);
++			this.context.lineTo(pos.x + p, pos.y + p + a);
++			this.context.stroke();
++		},
++		drawGameFigures: function() {
++			for (let i = 0; 9 > i; i++) {
++				let char = this.game.charAt(i),
++					x = this.getPoint(i % 3),
++					y = this.getPoint(Math.ceil((i + 1) / 3) - 1);
++
++				if (char === 'X') {
++					this.drawX({x: x, y: y});
++				} else if (char === 'O') {
++					this.drawO({x: x, y: y});
++				}
++			}
++		},
++		getMousePosition: function(e) {
++			const r = this.canvas.getBoundingClientRect();
++			return {
++				x: e.clientX - r.left,
++				y: e.clientY - r.top
++			};
++		},
++		getCell: function(e) {
++			let pos = this.getMousePosition(e);
++
++			let col = 0, x;
++			do {x = this.getPoint(col); col++;} while (pos.x > x && 3 >= col);
++			--col;
++
++			let row = 0, y;
++			do {y = this.getPoint(row); row++;} while (pos.y > y && 3 >= row);
++			--row;
++
++			if (row && col) {
++				return {
++					cell: --row * 3 + col,
++					pos: {
++						x: this.getPoint(--col),
++						y: this.getPoint(row)
++					}
++				};
++			} else {
++				return null;
++			}
++		},
++		cleanCanvas: function() {
++			this.context.clearRect(0, 0, this.canvasSize, this.canvasSize);
++		},
++		getWinner: function() {
++			let patterns = {'012':1, '345':1, '678':1, '036':2, '147':2, '258':2, '048':3, '246':4},
++				pattern = null,
++				figure;
++
++			for (let p in patterns) {
++				let fig = this.game.charAt(p[0]),
++					match = false;
++
++				if (fig !== '.') {
++					for (let i = 1; 3 > i; i++) {
++						match = (this.game.charAt(+p[i]) === fig);
++						if (!match) {
++							break;
++						}
++					}
++				}
++
++				if (match) {
++					pattern = p;
++					figure = fig;
++					break;
++				}
++			}
++
++			if (pattern) {
++				return {
++					pattern: pattern,
++					result: figure === this.figure ? YOU_WON : OPPONENT_WON,
++					type: patterns[pattern]
++				};
++			} else if (this.game.indexOf('.') == -1) {
++				return {
++					result: DRAWN
++				};
++			} else {
++				return null;
++			}
++		},
++		showResult: function() {
++			let result = this.getWinner();
++
++			if (result !== null) {
++				let x1, x2, y1, y2, p = this.gridCellSize * 0.1;
++
++				var btn = document.createElement('button');
++				btn.innerHTML = 'Play again with '+encode(this.opponent);
++				btn.classList.add('start-new-game-btn');
++				btn.addEventListener('click', function() {
++					startNewMatch(this.widget)
++						.then(() => {
++							jQuery('.dashbrd-grid-container').dashboardGrid('refreshWidget', widget['uniqueid']);
++						})
++						.catch(error => {
++							console.log(error)
++						});
++				}.bind(this));
++
++				var btn2 = document.createElement('a');
++				btn2.innerHTML = 'Start another game';
++				btn2.classList.add('start-new-game-btn');
++				btn2.classList.add('link-action');
++				btn2.addEventListener('click', function() {
++					startNewGame(this.widget)
++						.then(() => {
++							//refresh(widget);
++							jQuery('.dashbrd-grid-container').dashboardGrid('refreshWidget', widget['uniqueid']);// this.widget?
++						})
++						.catch(error => {
++							console.log(error)
++						});
++				}.bind(this));
++
++				if (result.result == DRAWN) {
++					this.showMessage('You both are great!', btn, btn2);
++					return true;
++				} else {
++					this.showMessage(result.result == YOU_WON ? 'You won!' : encode(this.opponent)+' won!', btn, btn2);
++				}
++
++				let c1 = +result.pattern.charAt(0);
++				switch (result.type) {
++					case 1:
++						x1 = this.getPoint(0) + p;
++						x2 = this.getPoint(3) - p;
++						y1 = this.getPoint(c1 / 3) + (this.gridCellSize * 0.5);
++						y2 = y1;
++						break;
++					case 2:
++						x1 = this.getPoint(c1 + 0.5);
++						x2 = x1;
++						y1 = this.getPoint(0) + p;
++						y2 = this.getPoint(3) - p;
++						break;
++					case 3:
++						x1 = this.getPoint(0) + p;
++						x2 = this.getPoint(3) - p;
++						y1 = this.getPoint(0) + p;
++						y2 = this.getPoint(3) - p;
++						break;
++					case 4:
++						x1 = this.getPoint(3) - p;
++						x2 = this.getPoint(0) + p;
++						y1 = this.getPoint(0) + p;
++						y2 = this.getPoint(3) - p;
++						break;
++				}
++
++				this.context.lineWidth = this.figureLineWidth - 4;
++				this.context.strokeStyle = this.crossLineColor;
++				this.context.lineCap = 'round';
++				this.context.beginPath();
++				this.context.moveTo(x1, y1);
++				this.context.lineTo(x2, y2);
++				this.context.stroke();
++
++				return true;
++			}
++
++			return false;
++		},
++		onMouseMoveHandler: function(e) {
++			if (this.frozen || (this.figure !== 'X' && this.figure !== 'O')) {
++				return;
++			}
++
++			let cell = this.getCell(e),
++				result = this.getWinner();
++
++			if (cell !== null && result === null && this.game.charAt(cell.cell-1) === '.') {
++				this.cleanCanvas();
++				this.drawGrid();
++				this.drawGameFigures();
++				if (this.figure === 'X') {
++					this.drawX(cell.pos, this.ghostColor);
++				} else {
++					this.drawO(cell.pos, this.ghostColor);
++				}
++			} else if (cell !== null && result === null) {
++				this.cleanCanvas();
++				this.drawGrid();
++				this.drawGameFigures();
++			}
++		},
++		onClickHandler: function(e) {
++			if (this.frozen || (this.figure !== 'X' && this.figure !== 'O')) {
++				return;
++			}
++
++			this.frozen = true;
++			let cell = this.getCell(e);
++			if (this.game.charAt(cell.cell - 1) === '.') {
++				this.updateLocally(cell.cell-1);
++
++				makeTheMove(cell.cell, this.widget).then(() => {
++					//setTimeout(function() {
++					//	jQuery('.dashbrd-grid-container').dashboardGrid('refreshWidget', this.widget['uniqueid']);
++					//}, 2000);
++					this.frozen = true;
++				})
++				.catch(error => {
++					console.log(error)
++				});
++			} else {
++				this.frozen = false;
++			}
++		},
++		updateLocally: function(index) {
++			this.game = this.game.substr(0, index) + this.figure + this.game.substr(index + 1);
++			let x = this.getPoint(index % 3),
++				y = this.getPoint(Math.ceil((index + 1) / 3) - 1);
++
++			if (this.figure === 'X') {
++				this.drawX({x: x, y: y});
++			} else if (this.figure === 'O') {
++				this.drawO({x: x, y: y});
++			}
++
++			!this.showResult() && this.showMessage('It\'s '+encode(this.opponent)+'\'s move.');
++		}
++	};
++
++	var makeTheMove = function(cell, widget) {
++		return new Promise((resolve, reject) => {
++			var url = new Curl('zabbix.php');
++			url.setArgument('action', 'widget.tictactoe.update');
++
++			$.ajax({
++				url: url.getUrl(),
++				type: 'POST',
++				data: {
++					'fields': JSON.stringify(widget.fields),
++					'uniqueid': widget.uniqueid,
++					'move': cell,
++					'do': 'makeTheMove'
++				},
++				success: function(data) {
++					resolve(data);
++				},
++				error: function(error) {
++					reject(error);
++				}
++			});
++		});
++	};
++
++	var startNewGame = function(widget) {
++		return new Promise((resolve, reject) => {
++			var url = new Curl('zabbix.php');
++			url.setArgument('action', 'widget.tictactoe.update');
++
++			$.ajax({
++				url: url.getUrl(),
++				type: 'POST',
++				data: {
++					'fields': JSON.stringify(widget.fields),
++					'uniqueid': widget.uniqueid,
++					'do': 'startNewGame'
++				},
++				success: function(data) {
++					resolve(data);
++				},
++				error: function(error) {
++					reject(error);
++				}
++			});
++		});
++	};
++
++	var startNewMatch = function(widget) {
++		return new Promise((resolve, reject) => {
++			var url = new Curl('zabbix.php');
++			url.setArgument('action', 'widget.tictactoe.update');
++
++			$.ajax({
++				url: url.getUrl(),
++				type: 'POST',
++				data: {
++					'fields': JSON.stringify(widget.fields),
++					'uniqueid': widget.uniqueid,
++					'do': 'startNewMatch'
++				},
++				success: function(data) {
++					resolve(data);
++				},
++				error: function(error) {
++					reject(error);
++				}
++			});
++		});
++	};
++
++	var joinTheGame = function(widget, itemid) {
++		return new Promise((resolve, reject) => {
++			var url = new Curl('zabbix.php');
++			url.setArgument('action', 'widget.tictactoe.update');
++
++			$.ajax({
++				url: url.getUrl(),
++				type: 'POST',
++				data: {
++					'fields': JSON.stringify(widget.fields),
++					'uniqueid': widget.uniqueid,
++					'itemid': itemid,
++					'do': 'joinTheGame'
++				},
++				success: function(data) {
++					resolve(data);
++				},
++				error: function(error) {
++					reject(error);
++				}
++			});
++		});
++	};
++
++	var refresh = function(widget, ttt) {
++//		console.log('refresh', (ttt.opponent === 'Bob' ? 'Alice' : 'Bob'), ttt.state);
++//
++//		if (ttt.state == STATE_OPPONENT_TURN) {
++//			jQuery('.dashbrd-grid-container').dashboardGrid('unpauseWidgetRefresh', widget['uniqueid']);
++//			jQuery('.dashbrd-grid-container').dashboardGrid('refreshWidget', widget['uniqueid']);
++//			jQuery('.dashbrd-grid-container').dashboardGrid('pauseWidgetRefresh', widget['uniqueid']);
++//		} else {
++//			jQuery('.dashbrd-grid-container').dashboardGrid('unpauseWidgetRefresh', widget['uniqueid']);
++//		}
++	};
++
++	var encode = function(str) {
++		return str.replace(/[\u00A0-\u9999<>\&]/gim, (i) => '&#'+i.charCodeAt(0)+';').replace(/&/gim, '&amp;');
++	};
++
++	var methods = {
++		init: function(options, widget) {
++			if (options.state > 0) {
++				var ttt = new ticTacToe();
++				ttt.initGame(jQuery.extend(options, {widget: widget}));
++
++				setTimeout(() => {
++					clearTimeout(ttt.refreshTimeout);
++					ttt.refreshTimeout = setTimeout(() => refresh(widget, ttt), 3000);
++				});
++			} else if (options.state == 0) {
++				// waiting oponent
++			} else {
++				let games_btns = widget['content_body'][0].getElementsByClassName('match-to-join'),
++					start_btns = widget['content_body'][0].getElementsByClassName('start-new-game-btn');
++
++				for (let btn of games_btns) {
++					btn.addEventListener('click', function(event) {
++						joinTheGame(widget, event.target.dataset.itemid)
++							.then(() => {
++								jQuery('.dashbrd-grid-container').dashboardGrid('refreshWidget', widget['uniqueid']);
++							})
++							.catch(error => {
++								console.log(error)
++							});
++					}.bind(this));
++				}
++
++				start_btns.length && start_btns[0].addEventListener('click', function() {
++					startNewGame(widget)
++						.then(() => {
++							jQuery('.dashbrd-grid-container').dashboardGrid('refreshWidget', widget['uniqueid']);
++						})
++						.catch(error => {
++							console.log(error)
++						});
++				}.bind(this));
++			}
++		}
++	};
++
++	$.fn.tictactoe = function() {
++		return methods.init.apply(this, arguments);
++	};
++});
+diff --git a/ui/jsLoader.php b/ui/jsLoader.php
+index ad5c17b59c..f11b15b91d 100644
+--- a/ui/jsLoader.php
++++ b/ui/jsLoader.php
+@@ -120,6 +120,10 @@ $availableJScripts = [
+ 	'popup.operation.common.js' => 'pages/'
+ ];
+ 
++$availableJScripts += [
++	'class.tictactoe.js' => ''
++];
++
+ $tranStrings = [
+ 	'gtlc.js' => [
+ 		'S_MINUTE_SHORT' => _x('m', 'minute short')

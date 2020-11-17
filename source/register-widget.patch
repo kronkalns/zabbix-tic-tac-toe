@@ -1,0 +1,90 @@
+diff --git a/ui/app/views/monitoring.dashboard.view.php b/ui/app/views/monitoring.dashboard.view.php
+index 007e267dbc..d099b88c37 100644
+--- a/ui/app/views/monitoring.dashboard.view.php
++++ b/ui/app/views/monitoring.dashboard.view.php
+@@ -47,6 +47,7 @@ $this->addJsFile('class.mapWidget.js');
+ $this->addJsFile('class.svg.canvas.js');
+ $this->addJsFile('class.svg.map.js');
+ $this->addJsFile('class.tab-indicators.js');
++$this->addJsFile('class.tictactoe.js');
+ 
+ $this->includeJsFile('dashboard/class.dashboard.js.php');
+ $this->includeJsFile('dashboard/class.dashboard-share.js.php');
+diff --git a/ui/include/classes/mvc/CRouter.php b/ui/include/classes/mvc/CRouter.php
+index 06b80e718c..882f351a1c 100644
+--- a/ui/include/classes/mvc/CRouter.php
++++ b/ui/include/classes/mvc/CRouter.php
+@@ -246,6 +246,8 @@ class CRouter {
+ 		'widget.trigover.view'			=> ['CControllerWidgetTrigOverView',				'layout.widget',		'monitoring.widget.trigover.view'],
+ 		'widget.url.view'				=> ['CControllerWidgetUrlView',						'layout.widget',		'monitoring.widget.url.view'],
+ 		'widget.web.view'				=> ['CControllerWidgetWebView',						'layout.widget',		'monitoring.widget.web.view'],
++		'widget.tictactoe.view'			=> ['CControllerWidgetTicTacToeView',				'layout.widget',		'monitoring.widget.tictactoe.view'],
++		'widget.tictactoe.update'		=> ['CControllerWidgetTicTacToeUpdate',				'layout.javascript',	null],
+ 
+ 		// legacy actions
+ 		'actionconf.php'				=> ['CLegacyAction', null, null],
+diff --git a/ui/include/classes/widgets/CWidgetConfig.php b/ui/include/classes/widgets/CWidgetConfig.php
+index a08e79b5cc..05bc9b42e4 100644
+--- a/ui/include/classes/widgets/CWidgetConfig.php
++++ b/ui/include/classes/widgets/CWidgetConfig.php
+@@ -60,6 +60,7 @@ class CWidgetConfig {
+ 			WIDGET_PROBLEMS_BY_SV		=> _('Problems by severity'),
+ 			WIDGET_SVG_GRAPH			=> _('Graph'),
+ 			WIDGET_SYSTEM_INFO			=> _('System information'),
++			WIDGET_TIC_TAC_TOE			=> _('Tic-Tac-Toe'),
+ 			WIDGET_TRIG_OVER			=> _('Trigger overview'),
+ 			WIDGET_URL					=> _('URL'),
+ 			WIDGET_WEB					=> _('Web monitoring')
+@@ -102,6 +103,7 @@ class CWidgetConfig {
+ 			WIDGET_PROBLEMS_BY_SV		=> ['width' => 12,	'height' => 5],
+ 			WIDGET_SVG_GRAPH			=> ['width' => 12,	'height' => 5],
+ 			WIDGET_SYSTEM_INFO			=> ['width' => 12,	'height' => 5],
++			WIDGET_TIC_TAC_TOE			=> ['width' => 6,	'height' => 6],
+ 			WIDGET_TRIG_OVER			=> ['width' => 12,	'height' => 5],
+ 			WIDGET_URL					=> ['width' => 12,	'height' => 5],
+ 			WIDGET_WEB					=> ['width' => 6,	'height' => 3]
+@@ -183,6 +185,7 @@ class CWidgetConfig {
+ 			case WIDGET_PROBLEMS:
+ 			case WIDGET_PROBLEMS_BY_SV:
+ 			case WIDGET_SVG_GRAPH:
++			case WIDGET_TIC_TAC_TOE:
+ 			case WIDGET_TRIG_OVER:
+ 			case WIDGET_WEB:
+ 				return SEC_PER_MIN;
+@@ -389,6 +392,9 @@ class CWidgetConfig {
+ 			case WIDGET_SVG_GRAPH:
+ 				return new CWidgetFormSvgGraph($data, $templateid);
+ 
++			case WIDGET_TIC_TAC_TOE:
++				return new CWidgetFormTicTacToe($data, $templateid);
++
+ 			case WIDGET_TRIG_OVER:
+ 				return new CWidgetFormTrigOver($data, $templateid);
+ 
+diff --git a/ui/include/defines.inc.php b/ui/include/defines.inc.php
+index 39238a5f00..05e0fcacde 100644
+--- a/ui/include/defines.inc.php
++++ b/ui/include/defines.inc.php
+@@ -1447,6 +1447,7 @@ define('WIDGET_SYSTEM_INFO',		'systeminfo');
+ define('WIDGET_TRIG_OVER',			'trigover');
+ define('WIDGET_URL',				'url');
+ define('WIDGET_WEB',				'web');
++define('WIDGET_TIC_TAC_TOE',		'tictactoe');
+ 
+ // sysmap widget source types
+ define('WIDGET_SYSMAP_SOURCETYPE_MAP',	1);
+diff --git a/ui/jsLoader.php b/ui/jsLoader.php
+index ad5c17b59c..f11b15b91d 100644
+--- a/ui/jsLoader.php
++++ b/ui/jsLoader.php
+@@ -120,6 +120,10 @@ $availableJScripts = [
+ 	'popup.operation.common.js' => 'pages/'
+ ];
+ 
++$availableJScripts += [
++	'class.tictactoe.js' => ''
++];
++
+ $tranStrings = [
+ 	'gtlc.js' => [
+ 		'S_MINUTE_SHORT' => _x('m', 'minute short')
